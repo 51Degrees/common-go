@@ -92,6 +92,6 @@ Test files:
 
 ## Related Projects
 - [51Degrees Device Detection Go](https://github.com/51Degrees/device-detection-go)
-- [51Degrees Examples Go](https://github.com/51Degrees/device-detection-examples-go)
+- [51Degrees Device Detection Examples Go](https://github.com/51Degrees/device-detection-examples-go)
 - [51Degrees IP Intelligence Go](https://github.com/51Degrees/ip-intelligence-go)
 - [51Degrees IP Intelligence Examples Go](https://github.com/51Degrees/ip-intelligence-examples-go)
