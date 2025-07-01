@@ -4,6 +4,94 @@
 
 [Reference Documentation](https://51degrees.github.io/ip-intelligence-go/4.4/examples.html "Reference documentation")
 
-# Introduction
+## Introduction
 
-The 51Degrees Common Go-Code Library contains common methods for update data files, check file changes etc
+The 51Degrees Common Go Library provides essential utilities and common functionality for 51Degrees Go projects. This library includes file management, logging, error handling, and data file update mechanisms that are shared across various 51Degrees Go implementations.
+
+## Features
+
+- **File Watching**: Monitor file changes and automatically trigger updates
+- **File Pulling**: Download and manage data files from remote sources
+- **File Updating**: Handle data file updates with validation and error handling
+- **Logging**: Configurable logging system for debugging and monitoring
+- **Error Handling**: Standardized error types and handling mechanisms
+
+## Installation
+
+```bash
+go get github.com/51Degrees/common-go
+```
+
+## Usage
+
+### File Watching
+
+The library provides file watching capabilities to monitor changes to data files:
+
+```bash
+go import "github.com/51Degrees/common-go"
+// Create a file watcher watcher, err := NewFileWatcher(filePath) if err != nil { log.Fatal(err) }
+// Start watching for changes go watcher.Watch()
+```
+
+
+### File Updating
+
+Manage data file updates with built-in validation:
+
+```bash
+go import "github.com/51Degrees/common-go"
+// Create a file updater updater := NewFileUpdater(config)
+// Update data files err := updater.Update() if err != nil { log.Printf("Update failed: %v", err) }
+
+```
+
+
+### Logging
+
+Configure logging for your application:
+
+```go
+import "github.com/51Degrees/common-go"
+
+// Initialize logger
+logger := NewLogger(logLevel)
+
+// Use logger
+logger.Info("Application started")
+logger.Error("An error occurred", err)
+```
+
+## Components
+### File Management
+- - File system monitoring `file_watch.go`
+- - Remote file downloading `file_pulling.go`
+- - Data file update management `file_updater.go`
+- - General file watching utilities `watcher.go`
+
+### Utilities
+- - Logging functionality `logger.go`
+- - Error handling and custom error types `errors.go`
+
+## Testing
+The library includes comprehensive test suites:
+
+```bash
+go test ./...
+```
+
+Test files:
+- `file_watch_test.go`
+- `file_pulling_test.go`
+- `file_updater_test.go`
+- `logger_test.go`
+
+## Requirements
+- Go 1.19 or higher
+- Compatible with Go modules
+
+## Related Projects
+- [51Degrees Device Detection Go](https://github.com/51Degrees/device-detection-go)
+- [51Degrees Examples Go](https://github.com/51Degrees/device-detection-examples-go)
+- [51Degrees IP Intelligence Go](https://github.com/51Degrees/ip-intelligence-go)
+- [51Degrees IP Intelligence Examples Go](https://github.com/51Degrees/ip-intelligence-examples-go)
