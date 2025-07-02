@@ -29,7 +29,7 @@ go get github.com/51Degrees/common-go
 The library provides file watching capabilities to monitor changes to data files:
 
 ```bash
-go import "github.com/51Degrees/common-go"
+go import "github.com/51Degrees/common-go/v4"
 // Create a file watcher watcher, err := NewFileWatcher(filePath) if err != nil { log.Fatal(err) }
 // Start watching for changes go watcher.Watch()
 ```
@@ -40,7 +40,7 @@ go import "github.com/51Degrees/common-go"
 Manage data file updates with built-in validation:
 
 ```bash
-go import "github.com/51Degrees/common-go"
+go import "github.com/51Degrees/common-go/v4"
 // Create a file updater updater := NewFileUpdater(config)
 // Update data files err := updater.Update() if err != nil { log.Printf("Update failed: %v", err) }
 
@@ -52,7 +52,7 @@ go import "github.com/51Degrees/common-go"
 Configure logging for your application:
 
 ```go
-import "github.com/51Degrees/common-go"
+import "github.com/51Degrees/common-go/v4"
 
 // Initialize logger
 logger := NewLogger(logLevel)
