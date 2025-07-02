@@ -19,7 +19,7 @@ The 51Degrees Common Go Library provides essential utilities and common function
 ## Installation
 
 ```bash
-go get github.com/51Degrees/common-go
+go get github.com/51Degrees/common-go/v4
 ```
 
 ## Usage
