@@ -1,7 +1,7 @@
 package common_go
 
 import (
-	"bytes"
+	"bufio"
 	"compress/gzip"
 	"crypto/md5"
 	"encoding/hex"
@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strconv"
 	"sync"
 	"time"
@@ -60,7 +61,9 @@ func (e *FileUpdater) doFilePulling(reloadFileEvents chan struct{}) int {
 		lastModificationTimestamp = &modTime
 	}
 
-	fileResponse, err := doDataFileRequest(e.dataFileUrl, e.logger, lastModificationTimestamp)
+	// The download goes to a temp file next to the data file and is renamed over it, so the
+	// engine only ever sees the complete old file or the complete new one.
+	fileResponse, err := doDataFileRequest(e.dataFileUrl, e.logger, lastModificationTimestamp, e.GetDataFile())
 	if err != nil {
 		e.logger.Printf("failed to pull data file: %v", err)
 		if errors.Is(err, ErrFileNotModified) {
@@ -78,17 +81,17 @@ func (e *FileUpdater) doFilePulling(reloadFileEvents chan struct{}) int {
 		}
 	}
 
-	e.logger.Printf("data file pulled successfully: %d bytes", fileResponse.buffer.Len())
+	e.logger.Printf("data file pulled successfully: %d bytes", fileResponse.size)
 
-	// write the file to disk
-	err = os.WriteFile(e.GetDataFile(), fileResponse.buffer.Bytes(), 0644)
+	err = os.Rename(fileResponse.path, e.GetDataFile())
 	if err != nil {
+		os.Remove(fileResponse.path)
 		e.logger.Printf("failed to write data file: %v", err)
 		// retry after 1 second, since we have unhandled error
 		// this can happen from disk write error or something else
 		return retryMs
 	}
-	e.logger.Printf("data file written successfully: %d bytes", fileResponse.buffer.Len())
+	e.logger.Printf("data file written successfully: %d bytes", fileResponse.size)
 
 	if !e.isFileWatcherEnabled {
 		// use the chan for reload the file and reload manager
@@ -107,16 +110,29 @@ func (e *FileUpdater) doFilePulling(reloadFileEvents chan struct{}) int {
 	return e.dataFilePullEveryMs
 }
 
-// FileResponse represents the response obtained from a file request, including its buffer and retry interval.
+// FileResponse represents the response obtained from a file request: the path of the temp file
+// holding the uncompressed data and its size, or the retry interval when the server asked to wait.
 type FileResponse struct {
-	buffer     *bytes.Buffer
+	path       string
+	size       int64
 	retryAfter int
 }
 
+// tempFilePattern names the file a pull is streamed into, next to the data file. It carries the data
+// file's name so that updaters sharing a directory never touch each other's downloads.
+func tempFilePattern(dataFile string) string {
+	return "." + filepath.Base(dataFile) + ".pull-*"
+}
+
 // doDataFileRequest performs an HTTP GET request to fetch a data file and handles retries, caching, and decompression.
-// It accepts a URL, a logger for logging messages, and an optional timestamp for conditional requests.
-// Returns a FileResponse containing the fetched data or an error if the request fails or conditions are not met.
-func doDataFileRequest(url string, logger *LogWrapper, timestamp *time.Time) (*FileResponse, error) {
+// It accepts a URL, a logger for logging messages, an optional timestamp for conditional requests, and the data file
+// path: the body is streamed into a temp file in that file's directory, decompressed on the fly while the MD5 of the
+// raw body is computed, so a multi-gigabyte data file needs no extra RAM. The directory needs free space for a second
+// copy of the data file until the caller renames the temp file over it.
+// Returns a FileResponse with the temp file path or an error if the request fails or conditions are not met.
+func doDataFileRequest(url string, logger *LogWrapper, timestamp *time.Time, dataFile string) (*FileResponse, error) {
+	removeStaleTempFiles(dataFile, logger)
+
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
 		return nil, err
@@ -153,54 +169,90 @@ func doDataFileRequest(url string, logger *LogWrapper, timestamp *time.Time) (*F
 		return nil, fmt.Errorf("failed to pull data file: %s", resp.Status)
 	}
 
-	var (
-		fileBytes     io.Reader
-		responseBytes []byte
-	)
+	// the MD5 header covers the raw body, compressed or not, so hash everything read from it
+	hash := md5.New()
+	body := bufio.NewReader(io.TeeReader(resp.Body, hash))
 
 	// check if the response is compressed
 	// if it is, decompress it
-	buffer := bytes.NewBuffer(make([]byte, 0))
-	_, err = buffer.ReadFrom(resp.Body)
-	responseBytes = buffer.Bytes()
-	contentType := http.DetectContentType(responseBytes)
-	if isGzip(contentType) {
-		fileBytes, err = gzip.NewReader(bytes.NewBuffer(responseBytes))
+	head, _ := body.Peek(512)
+	var fileBytes io.Reader = body
+	if isGzip(http.DetectContentType(head)) {
+		fileBytes, err = gzip.NewReader(body)
 		if err != nil {
 			return nil, fmt.Errorf("failed to decompress file: %v", err)
 		}
-		//	if the response is not compressed, read it directly
-	} else {
-		if err != nil {
-			return nil, fmt.Errorf("failed to read response: %v", err)
-		}
-		fileBytes = bytes.NewBuffer(responseBytes)
 	}
 
-	uncompressedBuffer := bytes.NewBuffer(make([]byte, 0))
-	_, err = uncompressedBuffer.ReadFrom(fileBytes)
+	tempFile, err := os.CreateTemp(filepath.Dir(dataFile), tempFilePattern(dataFile))
 	if err != nil {
-		return nil, fmt.Errorf("failed to read decompressed file: %v", err)
+		return nil, fmt.Errorf("failed to create temp file: %v", err)
 	}
-	uncompressedBytes := uncompressedBuffer.Bytes()
-	contentMD5 := resp.Header.Get("Content-MD5")
-	if len(contentMD5) > 0 {
-		isValid, err := validateMd5(responseBytes, contentMD5)
-		if err != nil {
-			return nil, fmt.Errorf("failed to validate MD5: %v", err)
+	size, err := writeDataFile(tempFile, fileBytes, body, dataFile)
+	if err == nil {
+		contentMD5 := resp.Header.Get("Content-MD5")
+		if len(contentMD5) > 0 {
+			if hex.EncodeToString(hash.Sum(nil)) != contentMD5 {
+				err = errors.New("MD5 validation failed")
+			}
+		} else {
+			logger.Printf("MD5 header not found in response, skipping validation")
 		}
-
-		if !isValid {
-			return nil, fmt.Errorf("MD5 validation failed")
-		}
-	} else {
-		logger.Printf("MD5 header not found in response, skipping validation")
+	}
+	if err != nil {
+		os.Remove(tempFile.Name())
+		return nil, err
 	}
 
 	return &FileResponse{
-		buffer:     bytes.NewBuffer(uncompressedBytes),
+		path:       tempFile.Name(),
+		size:       size,
 		retryAfter: 0,
 	}, nil
+}
+
+// writeDataFile copies the uncompressed data into the temp file, drains the rest of the body so the MD5 hash
+// covers it, flushes the file to disk and gives it the data file's permissions (0644 for a new data file).
+func writeDataFile(tempFile *os.File, data io.Reader, body io.Reader, dataFile string) (int64, error) {
+	size, err := io.Copy(tempFile, data)
+	if err != nil {
+		tempFile.Close()
+		return 0, fmt.Errorf("failed to write temp file: %v", err)
+	}
+	// the gzip reader stops before any trailing bytes
+	if _, err = io.Copy(io.Discard, body); err != nil {
+		tempFile.Close()
+		return 0, fmt.Errorf("failed to read response: %v", err)
+	}
+	// a rename after a power loss must not leave an empty data file behind
+	if err = tempFile.Sync(); err != nil {
+		tempFile.Close()
+		return 0, fmt.Errorf("failed to flush temp file: %v", err)
+	}
+	if err = tempFile.Close(); err != nil {
+		return 0, fmt.Errorf("failed to close temp file: %v", err)
+	}
+	mode := os.FileMode(0644)
+	if info, statErr := os.Stat(dataFile); statErr == nil {
+		mode = info.Mode().Perm()
+	}
+	if err = os.Chmod(tempFile.Name(), mode); err != nil {
+		return 0, fmt.Errorf("failed to set temp file permissions: %v", err)
+	}
+	return size, nil
+}
+
+// removeStaleTempFiles deletes temp files a previous pull of this data file left behind, for example after
+// the process was killed mid-download; otherwise every interrupted pull keeps a copy of the data file on disk.
+func removeStaleTempFiles(dataFile string, logger *LogWrapper) {
+	stale, _ := filepath.Glob(filepath.Join(filepath.Dir(dataFile), tempFilePattern(dataFile)))
+	for _, path := range stale {
+		if err := os.Remove(path); err != nil {
+			logger.Printf("failed to remove stale temp file %s: %v", path, err)
+		} else {
+			logger.Printf("removed stale temp file %s", path)
+		}
+	}
 }
 
 // isGzip checks if the given content type corresponds to a Gzip-compressed format. Returns true if it matches.

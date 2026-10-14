@@ -11,7 +11,7 @@ The 51Degrees Common Go Library provides essential utilities and common function
 ## Features
 
 - **File Watching**: Monitor file changes and automatically trigger updates
-- **File Pulling**: Download and manage data files from remote sources
+- **File Pulling**: Download and manage data files from remote sources. A download is streamed into a temp file next to the data file and renamed over it, so the data file's directory needs free space for a second copy of the file
 - **File Updating**: Handle data file updates with validation and error handling
 - **Logging**: Configurable logging system for debugging and monitoring
 - **Error Handling**: Standardized error types and handling mechanisms
