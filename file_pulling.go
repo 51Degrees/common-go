@@ -1,7 +1,7 @@
 package common_go
 
 import (
-	"bytes"
+	"bufio"
 	"compress/gzip"
 	"crypto/md5"
 	"encoding/hex"
@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strconv"
 	"sync"
 	"time"
@@ -60,7 +61,9 @@ func (e *FileUpdater) doFilePulling(reloadFileEvents chan struct{}) int {
 		lastModificationTimestamp = &modTime
 	}
 
-	fileResponse, err := doDataFileRequest(e.dataFileUrl, e.logger, lastModificationTimestamp)
+	// The download goes to a temp file next to the data file and is renamed over it, so the
+	// engine only ever sees the complete old file or the complete new one.
+	fileResponse, err := doDataFileRequest(e.dataFileUrl, e.logger, lastModificationTimestamp, filepath.Dir(e.GetDataFile()))
 	if err != nil {
 		e.logger.Printf("failed to pull data file: %v", err)
 		if errors.Is(err, ErrFileNotModified) {
@@ -78,17 +81,17 @@ func (e *FileUpdater) doFilePulling(reloadFileEvents chan struct{}) int {
 		}
 	}
 
-	e.logger.Printf("data file pulled successfully: %d bytes", fileResponse.buffer.Len())
+	e.logger.Printf("data file pulled successfully: %d bytes", fileResponse.size)
 
-	// write the file to disk
-	err = os.WriteFile(e.GetDataFile(), fileResponse.buffer.Bytes(), 0644)
+	err = os.Rename(fileResponse.path, e.GetDataFile())
 	if err != nil {
+		os.Remove(fileResponse.path)
 		e.logger.Printf("failed to write data file: %v", err)
 		// retry after 1 second, since we have unhandled error
 		// this can happen from disk write error or something else
 		return retryMs
 	}
-	e.logger.Printf("data file written successfully: %d bytes", fileResponse.buffer.Len())
+	e.logger.Printf("data file written successfully: %d bytes", fileResponse.size)
 
 	if !e.isFileWatcherEnabled {
 		// use the chan for reload the file and reload manager
@@ -107,16 +110,20 @@ func (e *FileUpdater) doFilePulling(reloadFileEvents chan struct{}) int {
 	return e.dataFilePullEveryMs
 }
 
-// FileResponse represents the response obtained from a file request, including its buffer and retry interval.
+// FileResponse represents the response obtained from a file request: the path of the temp file
+// holding the uncompressed data and its size, or the retry interval when the server asked to wait.
 type FileResponse struct {
-	buffer     *bytes.Buffer
+	path       string
+	size       int64
 	retryAfter int
 }
 
 // doDataFileRequest performs an HTTP GET request to fetch a data file and handles retries, caching, and decompression.
-// It accepts a URL, a logger for logging messages, and an optional timestamp for conditional requests.
-// Returns a FileResponse containing the fetched data or an error if the request fails or conditions are not met.
-func doDataFileRequest(url string, logger *LogWrapper, timestamp *time.Time) (*FileResponse, error) {
+// It accepts a URL, a logger for logging messages, an optional timestamp for conditional requests, and the directory
+// for the temp file the data is streamed into. The body is never held in memory: it is decompressed on the fly into
+// the temp file while the MD5 of the raw body is computed, so a multi-gigabyte data file needs no extra RAM.
+// Returns a FileResponse with the temp file path or an error if the request fails or conditions are not met.
+func doDataFileRequest(url string, logger *LogWrapper, timestamp *time.Time, dir string) (*FileResponse, error) {
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
 		return nil, err
@@ -153,52 +160,55 @@ func doDataFileRequest(url string, logger *LogWrapper, timestamp *time.Time) (*F
 		return nil, fmt.Errorf("failed to pull data file: %s", resp.Status)
 	}
 
-	var (
-		fileBytes     io.Reader
-		responseBytes []byte
-	)
+	// the MD5 header covers the raw body, compressed or not, so hash everything read from it
+	hash := md5.New()
+	body := bufio.NewReader(io.TeeReader(resp.Body, hash))
 
 	// check if the response is compressed
 	// if it is, decompress it
-	buffer := bytes.NewBuffer(make([]byte, 0))
-	_, err = buffer.ReadFrom(resp.Body)
-	responseBytes = buffer.Bytes()
-	contentType := http.DetectContentType(responseBytes)
-	if isGzip(contentType) {
-		fileBytes, err = gzip.NewReader(bytes.NewBuffer(responseBytes))
+	head, _ := body.Peek(512)
+	var fileBytes io.Reader = body
+	if isGzip(http.DetectContentType(head)) {
+		fileBytes, err = gzip.NewReader(body)
 		if err != nil {
 			return nil, fmt.Errorf("failed to decompress file: %v", err)
 		}
-		//	if the response is not compressed, read it directly
-	} else {
-		if err != nil {
-			return nil, fmt.Errorf("failed to read response: %v", err)
-		}
-		fileBytes = bytes.NewBuffer(responseBytes)
 	}
 
-	uncompressedBuffer := bytes.NewBuffer(make([]byte, 0))
-	_, err = uncompressedBuffer.ReadFrom(fileBytes)
+	tempFile, err := os.CreateTemp(dir, ".pull-*")
 	if err != nil {
-		return nil, fmt.Errorf("failed to read decompressed file: %v", err)
+		return nil, fmt.Errorf("failed to create temp file: %v", err)
 	}
-	uncompressedBytes := uncompressedBuffer.Bytes()
-	contentMD5 := resp.Header.Get("Content-MD5")
-	if len(contentMD5) > 0 {
-		isValid, err := validateMd5(responseBytes, contentMD5)
-		if err != nil {
-			return nil, fmt.Errorf("failed to validate MD5: %v", err)
+	size, err := io.Copy(tempFile, fileBytes)
+	if err == nil {
+		// the gzip reader stops before any trailing bytes; read them so the hash is complete
+		_, err = io.Copy(io.Discard, body)
+	}
+	if closeErr := tempFile.Close(); err == nil {
+		err = closeErr
+	}
+	if err == nil {
+		// the previous implementation wrote the data file with these permissions
+		err = os.Chmod(tempFile.Name(), 0644)
+	}
+	if err == nil {
+		contentMD5 := resp.Header.Get("Content-MD5")
+		if len(contentMD5) > 0 {
+			if hex.EncodeToString(hash.Sum(nil)) != contentMD5 {
+				err = errors.New("MD5 validation failed")
+			}
+		} else {
+			logger.Printf("MD5 header not found in response, skipping validation")
 		}
-
-		if !isValid {
-			return nil, fmt.Errorf("MD5 validation failed")
-		}
-	} else {
-		logger.Printf("MD5 header not found in response, skipping validation")
+	}
+	if err != nil {
+		os.Remove(tempFile.Name())
+		return nil, fmt.Errorf("failed to read response: %v", err)
 	}
 
 	return &FileResponse{
-		buffer:     bytes.NewBuffer(uncompressedBytes),
+		path:       tempFile.Name(),
+		size:       size,
 		retryAfter: 0,
 	}, nil
 }

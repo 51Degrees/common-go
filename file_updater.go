@@ -2,6 +2,7 @@ package common_go
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sync"
@@ -218,10 +219,11 @@ func (e *FileUpdater) copyFileForReloadManager() (string, error) {
 
 // copyToTempFile copies the contents of the data file to a temporary file and returns the temp directory and file name.
 func (e *FileUpdater) copyToTempFile() (string, string, error) {
-	data, err := os.ReadFile(e.dataFile)
+	src, err := os.Open(e.dataFile)
 	if err != nil {
 		return "", "", fmt.Errorf("failed to read data file: %w", err)
 	}
+	defer src.Close()
 	originalFileName := filepath.Base(e.dataFile)
 
 	f, err := os.CreateTemp(e.tempDataDir, originalFileName)
@@ -230,7 +232,8 @@ func (e *FileUpdater) copyToTempFile() (string, string, error) {
 	}
 	defer f.Close()
 
-	_, err = f.Write(data)
+	// streamed so that a multi-gigabyte data file is not loaded into memory
+	_, err = io.Copy(f, src)
 	if err != nil {
 		return "", "", fmt.Errorf("failed to write temp data file: %w", err)
 	}

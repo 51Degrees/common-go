@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -199,6 +200,15 @@ func createGzipFile(t *testing.T, content string) []byte {
 	return buf.Bytes()
 }
 
+func readTempFile(t *testing.T, path string) string {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("reading %s: %v", path, err)
+	}
+	return string(data)
+}
+
 func calculateMD5(data []byte) string {
 	h := md5.New()
 	h.Write(data)
@@ -301,7 +311,7 @@ func TestDoDataFileRequest_Success(t *testing.T) {
 
 	logger := &LogWrapper{}
 
-	result, err := doDataFileRequest(server.URL, logger, nil)
+	result, err := doDataFileRequest(server.URL, logger, nil, t.TempDir())
 
 	if err != nil {
 		t.Errorf("doDataFileRequest() unexpected error: %v", err)
@@ -309,8 +319,8 @@ func TestDoDataFileRequest_Success(t *testing.T) {
 	if result == nil {
 		t.Fatal("doDataFileRequest() returned nil result")
 	}
-	if result.buffer.String() != testData {
-		t.Errorf("doDataFileRequest() content = %s, want %s", result.buffer.String(), testData)
+	if got := readTempFile(t, result.path); got != testData {
+		t.Errorf("doDataFileRequest() content = %s, want %s", got, testData)
 	}
 	if result.retryAfter != 0 {
 		t.Errorf("doDataFileRequest() retryAfter = %d, want 0", result.retryAfter)
@@ -331,7 +341,7 @@ func TestDoDataFileRequest_GzipContent(t *testing.T) {
 
 	logger := &LogWrapper{}
 
-	result, err := doDataFileRequest(server.URL, logger, nil)
+	result, err := doDataFileRequest(server.URL, logger, nil, t.TempDir())
 
 	if err != nil {
 		t.Errorf("doDataFileRequest() unexpected error: %v", err)
@@ -339,8 +349,8 @@ func TestDoDataFileRequest_GzipContent(t *testing.T) {
 	if result == nil {
 		t.Fatal("doDataFileRequest() returned nil result")
 	}
-	if result.buffer.String() != testData {
-		t.Errorf("doDataFileRequest() content = %s, want %s", result.buffer.String(), testData)
+	if got := readTempFile(t, result.path); got != testData {
+		t.Errorf("doDataFileRequest() content = %s, want %s", got, testData)
 	}
 }
 
@@ -351,7 +361,7 @@ func TestDoDataFileRequest_NotModified(t *testing.T) {
 	logger := &LogWrapper{}
 	timestamp := time.Now()
 
-	result, err := doDataFileRequest(server.URL, logger, &timestamp)
+	result, err := doDataFileRequest(server.URL, logger, &timestamp, t.TempDir())
 
 	if !errors.Is(err, ErrFileNotModified) {
 		t.Errorf("doDataFileRequest() error = %v, want ErrFileNotModified", err)
@@ -370,7 +380,7 @@ func TestDoDataFileRequest_InvalidRetryAfter(t *testing.T) {
 
 	logger := &LogWrapper{}
 
-	result, err := doDataFileRequest(server.URL, logger, nil)
+	result, err := doDataFileRequest(server.URL, logger, nil, t.TempDir())
 
 	if err == nil {
 		t.Errorf("doDataFileRequest() expected error for invalid Retry-After")
@@ -386,7 +396,7 @@ func TestDoDataFileRequest_ServerError(t *testing.T) {
 
 	logger := &LogWrapper{}
 
-	result, err := doDataFileRequest(server.URL, logger, nil)
+	result, err := doDataFileRequest(server.URL, logger, nil, t.TempDir())
 
 	if err == nil {
 		t.Errorf("doDataFileRequest() expected error for server error")
@@ -408,7 +418,7 @@ func TestDoDataFileRequest_InvalidMD5(t *testing.T) {
 
 	logger := &LogWrapper{}
 
-	result, err := doDataFileRequest(server.URL, logger, nil)
+	result, err := doDataFileRequest(server.URL, logger, nil, t.TempDir())
 
 	if err == nil {
 		t.Errorf("doDataFileRequest() expected error for invalid MD5")
@@ -429,7 +439,7 @@ func TestDoDataFileRequest_NoMD5Header(t *testing.T) {
 
 	logger := &LogWrapper{}
 
-	result, err := doDataFileRequest(server.URL, logger, nil)
+	result, err := doDataFileRequest(server.URL, logger, nil, t.TempDir())
 
 	if err != nil {
 		t.Errorf("doDataFileRequest() unexpected error: %v", err)
@@ -442,12 +452,77 @@ func TestDoDataFileRequest_NoMD5Header(t *testing.T) {
 func TestDoDataFileRequest_InvalidURL(t *testing.T) {
 	logger := &LogWrapper{}
 
-	result, err := doDataFileRequest("invalid://url", logger, nil)
+	result, err := doDataFileRequest("invalid://url", logger, nil, t.TempDir())
 
 	if err == nil {
 		t.Errorf("doDataFileRequest() expected error for invalid URL")
 	}
 	if result != nil {
 		t.Errorf("doDataFileRequest() result should be nil for invalid URL")
+	}
+}
+
+// A failed pull must leave the current data file untouched and no temp file behind.
+func TestDoFilePulling_KeepsDataFileOnFailure(t *testing.T) {
+	dir := t.TempDir()
+	dataFile := filepath.Join(dir, "data.hash")
+	if err := os.WriteFile(dataFile, []byte("current"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	for name, server := range map[string]*httptest.Server{
+		"server error": createMockServer(http.StatusInternalServerError, nil, nil),
+		"bad md5":      createMockServer(http.StatusOK, map[string]string{"Content-MD5": "wrong"}, []byte("new")),
+	} {
+		t.Run(name, func(t *testing.T) {
+			defer server.Close()
+			updater := NewFileUpdater(server.URL)
+			updater.SetDataFile(dataFile)
+			updater.SetLoggerEnabled(false)
+
+			if next := updater.doFilePulling(make(chan struct{}, 1)); next != retryMs {
+				t.Errorf("next pull in %d ms, want %d", next, retryMs)
+			}
+			if got := readTempFile(t, dataFile); got != "current" {
+				t.Errorf("data file content = %q, want unchanged", got)
+			}
+			entries, _ := os.ReadDir(dir)
+			if len(entries) != 1 {
+				t.Errorf("directory has %d entries, want only the data file", len(entries))
+			}
+		})
+	}
+}
+
+// A successful pull replaces the data file with the uncompressed download in one rename.
+func TestDoFilePulling_ReplacesDataFile(t *testing.T) {
+	dir := t.TempDir()
+	dataFile := filepath.Join(dir, "data.hash")
+	if err := os.WriteFile(dataFile, []byte("current"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	gzipData := createGzipFile(t, "new content")
+	server := createMockServer(http.StatusOK, map[string]string{"Content-MD5": calculateMD5(gzipData)}, gzipData)
+	defer server.Close()
+
+	updater := NewFileUpdater(server.URL)
+	updater.SetDataFile(dataFile)
+	updater.SetLoggerEnabled(false)
+	updater.SetIsFileWatcherEnabled(false) // the pull itself must announce the new file
+	reload := make(chan struct{}, 1)
+
+	if next := updater.doFilePulling(reload); next != updater.GetDataFilePullEveryMs() {
+		t.Errorf("next pull in %d ms, want %d", next, updater.GetDataFilePullEveryMs())
+	}
+	if got := readTempFile(t, dataFile); got != "new content" {
+		t.Errorf("data file content = %q, want the download", got)
+	}
+	if entries, _ := os.ReadDir(dir); len(entries) != 1 {
+		t.Errorf("directory has %d entries, want only the data file", len(entries))
+	}
+	select {
+	case <-reload:
+	default:
+		t.Error("no reload event sent")
 	}
 }
