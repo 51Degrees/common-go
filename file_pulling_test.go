@@ -311,7 +311,7 @@ func TestDoDataFileRequest_Success(t *testing.T) {
 
 	logger := &LogWrapper{}
 
-	result, err := doDataFileRequest(server.URL, logger, nil, t.TempDir())
+	result, err := doDataFileRequest(server.URL, logger, nil, filepath.Join(t.TempDir(), "data"))
 
 	if err != nil {
 		t.Errorf("doDataFileRequest() unexpected error: %v", err)
@@ -341,7 +341,7 @@ func TestDoDataFileRequest_GzipContent(t *testing.T) {
 
 	logger := &LogWrapper{}
 
-	result, err := doDataFileRequest(server.URL, logger, nil, t.TempDir())
+	result, err := doDataFileRequest(server.URL, logger, nil, filepath.Join(t.TempDir(), "data"))
 
 	if err != nil {
 		t.Errorf("doDataFileRequest() unexpected error: %v", err)
@@ -361,7 +361,7 @@ func TestDoDataFileRequest_NotModified(t *testing.T) {
 	logger := &LogWrapper{}
 	timestamp := time.Now()
 
-	result, err := doDataFileRequest(server.URL, logger, &timestamp, t.TempDir())
+	result, err := doDataFileRequest(server.URL, logger, &timestamp, filepath.Join(t.TempDir(), "data"))
 
 	if !errors.Is(err, ErrFileNotModified) {
 		t.Errorf("doDataFileRequest() error = %v, want ErrFileNotModified", err)
@@ -380,7 +380,7 @@ func TestDoDataFileRequest_InvalidRetryAfter(t *testing.T) {
 
 	logger := &LogWrapper{}
 
-	result, err := doDataFileRequest(server.URL, logger, nil, t.TempDir())
+	result, err := doDataFileRequest(server.URL, logger, nil, filepath.Join(t.TempDir(), "data"))
 
 	if err == nil {
 		t.Errorf("doDataFileRequest() expected error for invalid Retry-After")
@@ -396,7 +396,7 @@ func TestDoDataFileRequest_ServerError(t *testing.T) {
 
 	logger := &LogWrapper{}
 
-	result, err := doDataFileRequest(server.URL, logger, nil, t.TempDir())
+	result, err := doDataFileRequest(server.URL, logger, nil, filepath.Join(t.TempDir(), "data"))
 
 	if err == nil {
 		t.Errorf("doDataFileRequest() expected error for server error")
@@ -418,7 +418,7 @@ func TestDoDataFileRequest_InvalidMD5(t *testing.T) {
 
 	logger := &LogWrapper{}
 
-	result, err := doDataFileRequest(server.URL, logger, nil, t.TempDir())
+	result, err := doDataFileRequest(server.URL, logger, nil, filepath.Join(t.TempDir(), "data"))
 
 	if err == nil {
 		t.Errorf("doDataFileRequest() expected error for invalid MD5")
@@ -439,7 +439,7 @@ func TestDoDataFileRequest_NoMD5Header(t *testing.T) {
 
 	logger := &LogWrapper{}
 
-	result, err := doDataFileRequest(server.URL, logger, nil, t.TempDir())
+	result, err := doDataFileRequest(server.URL, logger, nil, filepath.Join(t.TempDir(), "data"))
 
 	if err != nil {
 		t.Errorf("doDataFileRequest() unexpected error: %v", err)
@@ -452,7 +452,7 @@ func TestDoDataFileRequest_NoMD5Header(t *testing.T) {
 func TestDoDataFileRequest_InvalidURL(t *testing.T) {
 	logger := &LogWrapper{}
 
-	result, err := doDataFileRequest("invalid://url", logger, nil, t.TempDir())
+	result, err := doDataFileRequest("invalid://url", logger, nil, filepath.Join(t.TempDir(), "data"))
 
 	if err == nil {
 		t.Errorf("doDataFileRequest() expected error for invalid URL")
@@ -498,7 +498,11 @@ func TestDoFilePulling_KeepsDataFileOnFailure(t *testing.T) {
 func TestDoFilePulling_ReplacesDataFile(t *testing.T) {
 	dir := t.TempDir()
 	dataFile := filepath.Join(dir, "data.hash")
-	if err := os.WriteFile(dataFile, []byte("current"), 0644); err != nil {
+	if err := os.WriteFile(dataFile, []byte("current"), 0640); err != nil {
+		t.Fatal(err)
+	}
+	// a pull interrupted earlier left this behind
+	if err := os.WriteFile(filepath.Join(dir, ".pull-stale"), []byte("partial"), 0600); err != nil {
 		t.Fatal(err)
 	}
 	gzipData := createGzipFile(t, "new content")
@@ -518,7 +522,10 @@ func TestDoFilePulling_ReplacesDataFile(t *testing.T) {
 		t.Errorf("data file content = %q, want the download", got)
 	}
 	if entries, _ := os.ReadDir(dir); len(entries) != 1 {
-		t.Errorf("directory has %d entries, want only the data file", len(entries))
+		t.Errorf("directory has %d entries, want only the data file (stale temp file removed)", len(entries))
+	}
+	if info, _ := os.Stat(dataFile); info.Mode().Perm() != 0640 {
+		t.Errorf("data file mode = %v, want the previous 0640", info.Mode().Perm())
 	}
 	select {
 	case <-reload:

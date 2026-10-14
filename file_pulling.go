@@ -63,7 +63,7 @@ func (e *FileUpdater) doFilePulling(reloadFileEvents chan struct{}) int {
 
 	// The download goes to a temp file next to the data file and is renamed over it, so the
 	// engine only ever sees the complete old file or the complete new one.
-	fileResponse, err := doDataFileRequest(e.dataFileUrl, e.logger, lastModificationTimestamp, filepath.Dir(e.GetDataFile()))
+	fileResponse, err := doDataFileRequest(e.dataFileUrl, e.logger, lastModificationTimestamp, e.GetDataFile())
 	if err != nil {
 		e.logger.Printf("failed to pull data file: %v", err)
 		if errors.Is(err, ErrFileNotModified) {
@@ -118,12 +118,18 @@ type FileResponse struct {
 	retryAfter int
 }
 
+// tempFilePattern names the file a pull is streamed into, next to the data file.
+const tempFilePattern = ".pull-*"
+
 // doDataFileRequest performs an HTTP GET request to fetch a data file and handles retries, caching, and decompression.
-// It accepts a URL, a logger for logging messages, an optional timestamp for conditional requests, and the directory
-// for the temp file the data is streamed into. The body is never held in memory: it is decompressed on the fly into
-// the temp file while the MD5 of the raw body is computed, so a multi-gigabyte data file needs no extra RAM.
+// It accepts a URL, a logger for logging messages, an optional timestamp for conditional requests, and the data file
+// path: the body is streamed into a temp file in that file's directory, decompressed on the fly while the MD5 of the
+// raw body is computed, so a multi-gigabyte data file needs no extra RAM. The directory needs free space for a second
+// copy of the data file until the caller renames the temp file over it.
 // Returns a FileResponse with the temp file path or an error if the request fails or conditions are not met.
-func doDataFileRequest(url string, logger *LogWrapper, timestamp *time.Time, dir string) (*FileResponse, error) {
+func doDataFileRequest(url string, logger *LogWrapper, timestamp *time.Time, dataFile string) (*FileResponse, error) {
+	removeStaleTempFiles(filepath.Dir(dataFile), logger)
+
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
 		return nil, err
@@ -175,22 +181,11 @@ func doDataFileRequest(url string, logger *LogWrapper, timestamp *time.Time, dir
 		}
 	}
 
-	tempFile, err := os.CreateTemp(dir, ".pull-*")
+	tempFile, err := os.CreateTemp(filepath.Dir(dataFile), tempFilePattern)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create temp file: %v", err)
 	}
-	size, err := io.Copy(tempFile, fileBytes)
-	if err == nil {
-		// the gzip reader stops before any trailing bytes; read them so the hash is complete
-		_, err = io.Copy(io.Discard, body)
-	}
-	if closeErr := tempFile.Close(); err == nil {
-		err = closeErr
-	}
-	if err == nil {
-		// the previous implementation wrote the data file with these permissions
-		err = os.Chmod(tempFile.Name(), 0644)
-	}
+	size, err := writeDataFile(tempFile, fileBytes, body, dataFile)
 	if err == nil {
 		contentMD5 := resp.Header.Get("Content-MD5")
 		if len(contentMD5) > 0 {
@@ -203,7 +198,7 @@ func doDataFileRequest(url string, logger *LogWrapper, timestamp *time.Time, dir
 	}
 	if err != nil {
 		os.Remove(tempFile.Name())
-		return nil, fmt.Errorf("failed to read response: %v", err)
+		return nil, err
 	}
 
 	return &FileResponse{
@@ -211,6 +206,50 @@ func doDataFileRequest(url string, logger *LogWrapper, timestamp *time.Time, dir
 		size:       size,
 		retryAfter: 0,
 	}, nil
+}
+
+// writeDataFile copies the uncompressed data into the temp file, drains the rest of the body so the MD5 hash
+// covers it, flushes the file to disk and gives it the data file's permissions (0644 for a new data file).
+func writeDataFile(tempFile *os.File, data io.Reader, body io.Reader, dataFile string) (int64, error) {
+	size, err := io.Copy(tempFile, data)
+	if err != nil {
+		tempFile.Close()
+		return 0, fmt.Errorf("failed to write temp file: %v", err)
+	}
+	// the gzip reader stops before any trailing bytes
+	if _, err = io.Copy(io.Discard, body); err != nil {
+		tempFile.Close()
+		return 0, fmt.Errorf("failed to read response: %v", err)
+	}
+	// a rename after a power loss must not leave an empty data file behind
+	if err = tempFile.Sync(); err != nil {
+		tempFile.Close()
+		return 0, fmt.Errorf("failed to flush temp file: %v", err)
+	}
+	if err = tempFile.Close(); err != nil {
+		return 0, fmt.Errorf("failed to close temp file: %v", err)
+	}
+	mode := os.FileMode(0644)
+	if info, statErr := os.Stat(dataFile); statErr == nil {
+		mode = info.Mode().Perm()
+	}
+	if err = os.Chmod(tempFile.Name(), mode); err != nil {
+		return 0, fmt.Errorf("failed to set temp file permissions: %v", err)
+	}
+	return size, nil
+}
+
+// removeStaleTempFiles deletes temp files a previous pull left behind, for example after the process was
+// killed mid-download; otherwise every interrupted pull keeps a copy of the data file on disk.
+func removeStaleTempFiles(dir string, logger *LogWrapper) {
+	stale, _ := filepath.Glob(filepath.Join(dir, tempFilePattern))
+	for _, path := range stale {
+		if err := os.Remove(path); err != nil {
+			logger.Printf("failed to remove stale temp file %s: %v", path, err)
+		} else {
+			logger.Printf("removed stale temp file %s", path)
+		}
+	}
 }
 
 // isGzip checks if the given content type corresponds to a Gzip-compressed format. Returns true if it matches.
