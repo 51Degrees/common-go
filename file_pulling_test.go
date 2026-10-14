@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -533,7 +534,7 @@ func TestDoFilePulling_ReplacesDataFile(t *testing.T) {
 	if entries, _ := os.ReadDir(dir); len(entries) != 2 {
 		t.Errorf("directory has %d entries, want the data file and the other updater's temp file", len(entries))
 	}
-	if info, _ := os.Stat(dataFile); info.Mode().Perm() != 0640 {
+	if info, _ := os.Stat(dataFile); runtime.GOOS != "windows" && info.Mode().Perm() != 0640 {
 		t.Errorf("data file mode = %v, want the previous 0640", info.Mode().Perm())
 	}
 	select {
