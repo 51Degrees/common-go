@@ -501,9 +501,12 @@ func TestDoFilePulling_ReplacesDataFile(t *testing.T) {
 	if err := os.WriteFile(dataFile, []byte("current"), 0640); err != nil {
 		t.Fatal(err)
 	}
-	// a pull interrupted earlier left this behind
-	if err := os.WriteFile(filepath.Join(dir, ".pull-stale"), []byte("partial"), 0600); err != nil {
-		t.Fatal(err)
+	// a pull of this file interrupted earlier left this behind; the other file belongs to another
+	// updater sharing the directory and may be mid-download, so it must survive
+	for _, name := range []string{".data.hash.pull-stale", ".other.ipi.pull-inprogress"} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("partial"), 0600); err != nil {
+			t.Fatal(err)
+		}
 	}
 	gzipData := createGzipFile(t, "new content")
 	server := createMockServer(http.StatusOK, map[string]string{"Content-MD5": calculateMD5(gzipData)}, gzipData)
@@ -521,8 +524,14 @@ func TestDoFilePulling_ReplacesDataFile(t *testing.T) {
 	if got := readTempFile(t, dataFile); got != "new content" {
 		t.Errorf("data file content = %q, want the download", got)
 	}
-	if entries, _ := os.ReadDir(dir); len(entries) != 1 {
-		t.Errorf("directory has %d entries, want only the data file (stale temp file removed)", len(entries))
+	if _, err := os.Stat(filepath.Join(dir, ".data.hash.pull-stale")); !os.IsNotExist(err) {
+		t.Error("own stale temp file was not removed")
+	}
+	if _, err := os.Stat(filepath.Join(dir, ".other.ipi.pull-inprogress")); err != nil {
+		t.Error("another updater's temp file was removed")
+	}
+	if entries, _ := os.ReadDir(dir); len(entries) != 2 {
+		t.Errorf("directory has %d entries, want the data file and the other updater's temp file", len(entries))
 	}
 	if info, _ := os.Stat(dataFile); info.Mode().Perm() != 0640 {
 		t.Errorf("data file mode = %v, want the previous 0640", info.Mode().Perm())

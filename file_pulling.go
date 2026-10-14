@@ -118,8 +118,11 @@ type FileResponse struct {
 	retryAfter int
 }
 
-// tempFilePattern names the file a pull is streamed into, next to the data file.
-const tempFilePattern = ".pull-*"
+// tempFilePattern names the file a pull is streamed into, next to the data file. It carries the data
+// file's name so that updaters sharing a directory never touch each other's downloads.
+func tempFilePattern(dataFile string) string {
+	return "." + filepath.Base(dataFile) + ".pull-*"
+}
 
 // doDataFileRequest performs an HTTP GET request to fetch a data file and handles retries, caching, and decompression.
 // It accepts a URL, a logger for logging messages, an optional timestamp for conditional requests, and the data file
@@ -128,7 +131,7 @@ const tempFilePattern = ".pull-*"
 // copy of the data file until the caller renames the temp file over it.
 // Returns a FileResponse with the temp file path or an error if the request fails or conditions are not met.
 func doDataFileRequest(url string, logger *LogWrapper, timestamp *time.Time, dataFile string) (*FileResponse, error) {
-	removeStaleTempFiles(filepath.Dir(dataFile), logger)
+	removeStaleTempFiles(dataFile, logger)
 
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
@@ -181,7 +184,7 @@ func doDataFileRequest(url string, logger *LogWrapper, timestamp *time.Time, dat
 		}
 	}
 
-	tempFile, err := os.CreateTemp(filepath.Dir(dataFile), tempFilePattern)
+	tempFile, err := os.CreateTemp(filepath.Dir(dataFile), tempFilePattern(dataFile))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create temp file: %v", err)
 	}
@@ -239,10 +242,10 @@ func writeDataFile(tempFile *os.File, data io.Reader, body io.Reader, dataFile s
 	return size, nil
 }
 
-// removeStaleTempFiles deletes temp files a previous pull left behind, for example after the process was
-// killed mid-download; otherwise every interrupted pull keeps a copy of the data file on disk.
-func removeStaleTempFiles(dir string, logger *LogWrapper) {
-	stale, _ := filepath.Glob(filepath.Join(dir, tempFilePattern))
+// removeStaleTempFiles deletes temp files a previous pull of this data file left behind, for example after
+// the process was killed mid-download; otherwise every interrupted pull keeps a copy of the data file on disk.
+func removeStaleTempFiles(dataFile string, logger *LogWrapper) {
+	stale, _ := filepath.Glob(filepath.Join(filepath.Dir(dataFile), tempFilePattern(dataFile)))
 	for _, path := range stale {
 		if err := os.Remove(path); err != nil {
 			logger.Printf("failed to remove stale temp file %s: %v", path, err)
